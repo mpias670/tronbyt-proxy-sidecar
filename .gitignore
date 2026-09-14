@@ -1,0 +1,4 @@
+/sidecar
+/tronbyt-proxy-sidecar
+*.log
+.env
