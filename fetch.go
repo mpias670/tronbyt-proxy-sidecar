@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/andybalholm/brotli"
@@ -79,6 +80,46 @@ type fetchDeps struct {
 	cache     *sessionCache
 	respCache *responseCache
 	client    *http.Client
+
+	browserMu       sync.Mutex
+	browserInflight map[string]*inflightBrowserFetch
+}
+
+// inflightBrowserFetch lets multiple callers requesting the exact same URL
+// concurrently wait on a single in-progress browser fetch instead of each
+// launching their own headless browser.
+type inflightBrowserFetch struct {
+	done chan struct{}
+	res  *browserFetchResult
+	err  error
+}
+
+// dedupedBrowserFetch runs browserFetch at most once per identical
+// concurrent targetURL: the first caller performs the fetch; any others
+// that arrive while it's in flight block and share the same result.
+func (d *fetchDeps) dedupedBrowserFetch(ctx context.Context, targetURL string) (*browserFetchResult, error) {
+	d.browserMu.Lock()
+	if d.browserInflight == nil {
+		d.browserInflight = make(map[string]*inflightBrowserFetch)
+	}
+	if in, ok := d.browserInflight[targetURL]; ok {
+		d.browserMu.Unlock()
+		<-in.done
+		return in.res, in.err
+	}
+	in := &inflightBrowserFetch{done: make(chan struct{})}
+	d.browserInflight[targetURL] = in
+	d.browserMu.Unlock()
+
+	res, err := browserFetch(ctx, d.cfg, targetURL)
+
+	d.browserMu.Lock()
+	in.res, in.err = res, err
+	delete(d.browserInflight, targetURL)
+	d.browserMu.Unlock()
+
+	close(in.done)
+	return res, err
 }
 
 func (d *fetchDeps) handleFetch(w http.ResponseWriter, r *http.Request) {
@@ -221,23 +262,31 @@ func (d *fetchDeps) fetchWithFallback(ctx context.Context, domain, targetURL str
 
 	d.cache.invalidate(domain)
 
-	newSess, err := d.cache.solveOnce(domain, d.cfg.BrowserCacheTTL, func() (*session, error) {
-		return solveChallenge(ctx, d.cfg, targetURL)
-	})
+	// Escalate to fetching targetURL's actual response from inside a live
+	// browser, rather than solving the challenge once and replaying the
+	// resulting cf_clearance cookie through the fast-path client. Cookie
+	// replay alone does not survive sites protected by Cloudflare
+	// Enterprise Bot Management (which scores every request's live
+	// TLS/HTTP fingerprint and JS-runtime behavior, not just cookie
+	// possession) -- see browserFetch's doc comment for the full
+	// rationale. dedupedBrowserFetch ensures concurrent requests for the
+	// exact same URL share one browser instead of racing to launch several.
+	result, err := d.dedupedBrowserFetch(ctx, targetURL)
 	if err != nil {
-		return 0, "", nil, fmt.Errorf("challenge solve failed: %w", err)
+		return 0, "", nil, fmt.Errorf("browser fetch failed: %w", err)
 	}
 
-	status, header, body, err = d.doRequest(ctx, targetURL, newSess)
-	if err != nil {
-		return 0, "", nil, err
-	}
-	if isChallengeResponse(status, header, body) {
-		d.cache.invalidate(domain)
-		return 0, "", nil, fmt.Errorf("still received a Cloudflare challenge after solving")
+	// Opportunistically cache the cookies/User-Agent the browser obtained,
+	// purely as a best-effort optimization for other, less strictly
+	// protected domains -- this fetch's own result already came straight
+	// from the browser and never depends on this cache entry.
+	d.cache.set(domain, result.session, d.cfg.BrowserCacheTTL)
+
+	if isChallengeResponse(result.status, result.header, result.body) {
+		return 0, "", nil, fmt.Errorf("still received a Cloudflare challenge after browser fetch")
 	}
 
-	return status, header.Get("Content-Type"), body, nil
+	return result.status, result.header.Get("Content-Type"), result.body, nil
 }
 
 func (d *fetchDeps) doRequest(ctx context.Context, targetURL string, sess *session) (int, http.Header, []byte, error) {
@@ -277,7 +326,6 @@ func (d *fetchDeps) doRequest(ctx context.Context, targetURL string, sess *sessi
 
 	return resp.StatusCode, resp.Header, body, nil
 }
-
 
 // decompress decodes body according to the upstream Content-Encoding header.
 // Returns body unchanged for encodings it doesn't recognize (e.g. empty/identity).

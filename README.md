@@ -28,13 +28,21 @@ heavy for something that idles almost all the time. This sidecar instead:
    succeeded every time.
 2. **Falls back to a short-lived headless Chromium only if challenged.** If
    (and only if) the fast path gets a Cloudflare challenge page back, the
-   sidecar launches headless Chromium just long enough to solve the
-   challenge, extracts the resulting `cf_clearance` cookie + User-Agent, and
-   **kills the browser immediately**. It never stays running between
-   requests.
-3. **Caches the solved session per domain** (in memory, with a TTL) so a
-   browser solve, when it does happen, is amortized across many subsequent
-   requests rather than repeated per-request.
+   sidecar launches headless Chromium just long enough to navigate directly
+   to the target URL and capture the actual response Cloudflare serves to
+   that live page load, then **kills the browser immediately**. It never
+   stays running between requests.
+3. **Fetches through the browser directly, rather than solving once and
+   replaying a cookie.** Sites protected by Cloudflare's stricter,
+   behavior-scoring bot management (not just a one-time JS challenge) can
+   solve a challenge correctly and still block the very next request from a
+   different client presenting the resulting `cf_clearance` cookie, because
+   the score is tied to the live request's fingerprint, not just cookie
+   possession. Performing the actual fetch inside the browser sidesteps
+   this: there's no cookie hand-off to mismatch. The browser's observed
+   cookies/User-Agent are still opportunistically cached per domain as a
+   best-effort optimization for less strictly protected sites, but this
+   fetch's own result never depends on that cache entry.
 
 ## Memory profile
 

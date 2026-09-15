@@ -17,27 +17,16 @@ type session struct {
 }
 
 // sessionCache is a small in-memory, per-domain cache of solved Cloudflare
-// sessions, plus in-flight de-duplication so concurrent requests for the
-// same domain trigger at most one browser solve instead of one each.
+// sessions (cookies + User-Agent), opportunistically populated as a
+// best-effort optimization for the cheap fast path.
 type sessionCache struct {
 	mu       sync.Mutex
 	sessions map[string]*session
-	inflight map[string]*inflightSolve
-}
-
-// inflightSolve lets multiple callers wait on a single solve-in-progress for
-// a given domain, so a burst of requests during a cold cache never spins up
-// more than one browser per domain concurrently.
-type inflightSolve struct {
-	done chan struct{}
-	sess *session
-	err  error
 }
 
 func newSessionCache() *sessionCache {
 	return &sessionCache{
 		sessions: make(map[string]*session),
-		inflight: make(map[string]*inflightSolve),
 	}
 }
 
@@ -60,36 +49,18 @@ func (c *sessionCache) invalidate(domain string) {
 	delete(c.sessions, domain)
 }
 
-// solveOnce runs solveFn at most once per domain concurrently: the first
-// caller for a domain executes solveFn and populates the cache; any callers
-// that arrive while that solve is in flight block and receive the same
-// result instead of launching their own browser.
-func (c *sessionCache) solveOnce(domain string, ttl time.Duration, solveFn func() (*session, error)) (*session, error) {
+// set stores a session for domain, e.g. one opportunistically observed
+// while performing a full browser-fetch for a different purpose. This is a
+// best-effort optimization only: for a domain under strict Cloudflare
+// Enterprise Bot Management, a replayed cookie won't actually unblock a
+// non-browser client, but for less strictly protected domains it can let
+// the cheap fast path succeed on subsequent requests.
+func (c *sessionCache) set(domain string, sess *session, ttl time.Duration) {
+	if sess == nil || ttl <= 0 {
+		return
+	}
+	sess.expiresAt = time.Now().Add(ttl)
 	c.mu.Lock()
-	if s, ok := c.sessions[domain]; ok && time.Now().Before(s.expiresAt) {
-		c.mu.Unlock()
-		return s, nil
-	}
-	if in, ok := c.inflight[domain]; ok {
-		c.mu.Unlock()
-		<-in.done
-		return in.sess, in.err
-	}
-	in := &inflightSolve{done: make(chan struct{})}
-	c.inflight[domain] = in
-	c.mu.Unlock()
-
-	sess, err := solveFn()
-
-	c.mu.Lock()
-	if err == nil {
-		sess.expiresAt = time.Now().Add(ttl)
-		c.sessions[domain] = sess
-	}
-	in.sess, in.err = sess, err
-	delete(c.inflight, domain)
-	c.mu.Unlock()
-
-	close(in.done)
-	return sess, err
+	defer c.mu.Unlock()
+	c.sessions[domain] = sess
 }
