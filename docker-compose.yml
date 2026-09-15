@@ -1,7 +1,7 @@
 services:
   sidecar:
     build: .
-    # Or, once published: image: ghcr.io/<you>/tronbyt-sidecar:latest
+    # Or, use the published image: image: ghcr.io/mpias670/tronbyt-proxy-sidecar:latest
     container_name: tronbyt-sidecar-dev
     restart: unless-stopped
     env_file: .env
