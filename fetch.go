@@ -39,11 +39,29 @@ var cloudflareChallengeMarkers = []string{
 	"challenges.cloudflare.com",
 	"Attention Required! | Cloudflare",
 	"cdn-cgi/challenge-platform",
+	// Cloudflare also serves a plain, decoy "502 Bad Gateway / nginx" page
+	// (with a distinctive trailing block of HTML-comment padding) to
+	// requests it's already confident are bots -- deliberately omitting the
+	// usual JS-challenge markers above so the block can't be fingerprinted
+	// and retried by naive scrapers. Observed paired with a real HTTP status
+	// of 403 despite the body's claimed "502", which a genuine origin error
+	// would not do.
+	"a padding to disable msie and chrome friendly error page",
 }
 
 func isChallengeResponse(status int, header http.Header, body []byte) bool {
 	if status == http.StatusForbidden || status == 503 {
 		if header.Get("cf-mitigated") == "challenge" {
+			return true
+		}
+		// Any non-2xx from a server that identifies itself as Cloudflare is
+		// worth a browser-solve attempt: Cloudflare fronts the entire
+		// allowlisted domain, so a 403/503 direct from its edge (as opposed
+		// to the real upstream) is far more likely to be a bot block than a
+		// genuine application-level error, even when the body doesn't match
+		// any of the known challenge-page markers below (see the decoy
+		// "502 Bad Gateway" page noted above).
+		if strings.Contains(strings.ToLower(header.Get("Server")), "cloudflare") {
 			return true
 		}
 	}
@@ -166,18 +184,18 @@ func (d *fetchDeps) fetchWithFallback(ctx context.Context, domain, targetURL str
 	sess := d.cache.get(domain)
 
 	var status int
-	var contentType string
+	var header http.Header
 	var body []byte
 	var err error
 
 	for attempt := 0; ; attempt++ {
-		status, contentType, body, err = d.doRequest(ctx, targetURL, sess)
+		status, header, body, err = d.doRequest(ctx, targetURL, sess)
 		if err != nil {
 			return 0, "", nil, err
 		}
 
 		if status >= 200 && status < 300 {
-			return status, contentType, body, nil
+			return status, header.Get("Content-Type"), body, nil
 		}
 
 		if !isTransientStatus(status) || attempt >= maxTransientRetries {
@@ -193,8 +211,8 @@ func (d *fetchDeps) fetchWithFallback(ctx context.Context, domain, targetURL str
 		}
 	}
 
-	if !isChallengeResponse(status, http.Header{"Content-Type": {contentType}}, body) {
-		return status, contentType, body, nil
+	if !isChallengeResponse(status, header, body) {
+		return status, header.Get("Content-Type"), body, nil
 	}
 
 	if d.cfg.DisableBrowserFallback {
@@ -210,22 +228,22 @@ func (d *fetchDeps) fetchWithFallback(ctx context.Context, domain, targetURL str
 		return 0, "", nil, fmt.Errorf("challenge solve failed: %w", err)
 	}
 
-	status, contentType, body, err = d.doRequest(ctx, targetURL, newSess)
+	status, header, body, err = d.doRequest(ctx, targetURL, newSess)
 	if err != nil {
 		return 0, "", nil, err
 	}
-	if isChallengeResponse(status, http.Header{"Content-Type": {contentType}}, body) {
+	if isChallengeResponse(status, header, body) {
 		d.cache.invalidate(domain)
 		return 0, "", nil, fmt.Errorf("still received a Cloudflare challenge after solving")
 	}
 
-	return status, contentType, body, nil
+	return status, header.Get("Content-Type"), body, nil
 }
 
-func (d *fetchDeps) doRequest(ctx context.Context, targetURL string, sess *session) (int, string, []byte, error) {
+func (d *fetchDeps) doRequest(ctx context.Context, targetURL string, sess *session) (int, http.Header, []byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
-		return 0, "", nil, err
+		return 0, nil, nil, err
 	}
 
 	userAgent := ""
@@ -239,13 +257,13 @@ func (d *fetchDeps) doRequest(ctx context.Context, targetURL string, sess *sessi
 
 	resp, err := d.client.Do(req)
 	if err != nil {
-		return 0, "", nil, err
+		return 0, nil, nil, err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamBodyBytes))
 	if err != nil {
-		return 0, "", nil, err
+		return 0, nil, nil, err
 	}
 
 	// Since we set our own Accept-Encoding header (to look like a real
@@ -254,11 +272,12 @@ func (d *fetchDeps) doRequest(ctx context.Context, targetURL string, sess *sessi
 	// so callers always get a plain, already-decoded body.
 	body, err = decompress(resp.Header.Get("Content-Encoding"), body)
 	if err != nil {
-		return 0, "", nil, fmt.Errorf("decompressing response: %w", err)
+		return 0, nil, nil, fmt.Errorf("decompressing response: %w", err)
 	}
 
-	return resp.StatusCode, resp.Header.Get("Content-Type"), body, nil
+	return resp.StatusCode, resp.Header, body, nil
 }
+
 
 // decompress decodes body according to the upstream Content-Encoding header.
 // Returns body unchanged for encodings it doesn't recognize (e.g. empty/identity).
